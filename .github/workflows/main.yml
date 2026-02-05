@@ -1,0 +1,222 @@
+name: Build InfiniteGUI DLL
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  BUILD_CONFIGURATION: Release
+  BUILD_PLATFORM: x64
+  VCPKG_DIR: ${{ github.workspace }}/vcpkg
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Detect and fix source file encoding
+      shell: pwsh
+      run: |
+        Write-Host "检测和修复源文件编码..."
+        
+        # 注册中文字符集提供程序
+        Add-Type -AssemblyName System.Text.Encoding
+        [System.Text.Encoding]::RegisterProvider([System.Text.CodePagesEncodingProvider]::Instance)
+        
+        $extensions = @('.cpp', '.h', '.hpp', '.c', '.cxx', '.cc', '.inl', '.txt', '.json')
+        
+        $totalFiles = 0
+        $convertedFiles = 0
+        $skippedFiles = 0
+        $gbkToUtf8Files = 0
+        
+        foreach ($ext in $extensions) {
+          Write-Host "处理扩展名: $ext"
+          $files = Get-ChildItem -Recurse -Path "*$ext" -File | Where-Object {
+            $_.FullName -notmatch "\\.git\\" -and $_.FullName -notmatch "\\.vs\\" -and $_.FullName -notmatch "\\.vcpkg\\"
+          }
+          
+          foreach ($file in $files) {
+            $totalFiles++
+            
+            try {
+              $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+              $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+              
+              if ($hasBom) {
+                $content = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
+                
+                # 关键修复：检查是否包含乱码字符(�)
+                if ($content -match '�') {
+                  Write-Host "检测到乱码字符，尝试GBK编码修复: $($file.Name)"
+                  
+                  # 尝试用GBK重新读取原始字节
+                  try {
+                    $gbk = [System.Text.Encoding]::GetEncoding(936)
+                    $gbkContent = $gbk.GetString($bytes)
+                    
+                    # 检查修复后是否还包含乱码字符
+                    if ($gbkContent -notmatch '�' -and $gbkContent -match '[\u4e00-\u9fff]') {
+                      # 保存为UTF-8 with BOM
+                      [System.IO.File]::WriteAllText($file.FullName, $gbkContent, [System.Text.Encoding]::UTF8)
+                      $convertedFiles++
+                      $gbkToUtf8Files++
+                      Write-Host "  ✓ GBK修复成功: $($file.Name)"
+                    } else {
+                      Write-Host "  ⚠ GBK修复无效，保持原样"
+                      $skippedFiles++
+                    }
+                  } catch {
+                    Write-Host "  ❌ GBK解码失败"
+                    $skippedFiles++
+                  }
+                } else {
+                  $skippedFiles++
+                  Write-Host "✓ 保持UTF-8 BOM: $($file.Name)"
+                }
+                continue
+              }
+              
+              $converted = $false
+              
+              try {
+                $utf8NoBom = [System.Text.Encoding]::UTF8
+                $content = $utf8NoBom.GetString($bytes)
+                
+                if ($content -match '�') {
+                  Write-Host "检测到乱码字符(无BOM)，尝试GBK修复: $($file.Name)"
+                  
+                  try {
+                    $gbk = [System.Text.Encoding]::GetEncoding(936)
+                    $gbkContent = $gbk.GetString($bytes)
+                    
+                    if ($gbkContent -notmatch '�' -and $gbkContent -match '[\u4e00-\u9fff]') {
+                      [System.IO.File]::WriteAllText($file.FullName, $gbkContent, [System.Text.Encoding]::UTF8)
+                      $convertedFiles++
+                      $gbkToUtf8Files++
+                      $converted = $true
+                      Write-Host "  ✓ GBK修复成功"
+                    }
+                  } catch {
+                    Write-Host "  ❌ GBK解码失败"
+                  }
+                } else {
+                  if ($content -match '[\u4e00-\u9fff]') {
+                    [System.IO.File]::WriteAllText($file.FullName, $content, [System.Text.Encoding]::UTF8)
+                    $convertedFiles++
+                    $converted = $true
+                    Write-Host "✓ UTF-8无BOM转有BOM: $($file.Name)"
+                  }
+                }
+              } catch { }
+              
+              if (-not $converted) {
+                try {
+                  $gbk = [System.Text.Encoding]::GetEncoding(936)
+                  $content = $gbk.GetString($bytes)
+                  if ($content -match '[\u4e00-\u9fff]' -and $content -notmatch '�') {
+                    [System.IO.File]::WriteAllText($file.FullName, $content, [System.Text.Encoding]::UTF8)
+                    $convertedFiles++
+                    $gbkToUtf8Files++
+                    $converted = $true
+                    Write-Host "✓ GBK转UTF-8: $($file.Name)"
+                  }
+                } catch { }
+              }
+              
+              if (-not $converted) {
+                try {
+                  $defaultEncoding = [System.Text.Encoding]::Default
+                  $content = $defaultEncoding.GetString($bytes)
+                  if ($content -match '[\u4e00-\u9fff]' -and $content -notmatch '�') {
+                    [System.IO.File]::WriteAllText($file.FullName, $content, [System.Text.Encoding]::UTF8)
+                    $convertedFiles++
+                    $converted = $true
+                    Write-Host "✓ 默认编码转UTF-8: $($file.Name)"
+                  }
+                } catch { }
+              }
+              
+              if (-not $converted) {
+                $content = [System.Text.Encoding]::UTF8.GetString($bytes)
+                [System.IO.File]::WriteAllText($file.FullName, $content, [System.Text.Encoding]::UTF8)
+                $convertedFiles++
+                Write-Host "✓ 无中文转UTF-8: $($file.Name)"
+              }
+              
+            } catch {
+              Write-Warning "处理文件失败: $($file.FullName)"
+            }
+          }
+        }
+        
+        Write-Host "`n转换统计:"
+        Write-Host "- 总文件数: $totalFiles"
+        Write-Host "- 已转换文件: $convertedFiles"
+        Write-Host "- GBK转UTF-8: $gbkToUtf8Files"
+        Write-Host "- 跳过文件: $skippedFiles"
+
+    - name: Install vcpkg and dependencies
+      shell: pwsh
+      run: |
+        git clone https://github.com/microsoft/vcpkg.git "$env:VCPKG_DIR"
+        & "$env:VCPKG_DIR\bootstrap-vcpkg.bat" -disableMetrics
+        & "$env:VCPKG_DIR\vcpkg.exe" install nlohmann-json:x64-windows
+        & "$env:VCPKG_DIR\vcpkg.exe" install glew:x64-windows
+        & "$env:VCPKG_DIR\vcpkg.exe" install stb:x64-windows
+        & "$env:VCPKG_DIR\vcpkg.exe" integrate install
+
+    - name: Setup Visual Studio
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build project
+      shell: pwsh
+      run: |
+        Write-Host "构建项目..."
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        
+        msbuild "InfiniteGUI-DLL.sln" `
+          /p:Configuration=${{ env.BUILD_CONFIGURATION }} `
+          /p:Platform=${{ env.BUILD_PLATFORM }} `
+          /p:PlatformToolset=v143 `
+          /p:WindowsTargetPlatformVersion=10.0 `
+          /p:CharacterSet=Unicode `
+          /p:VcpkgEnabled=true `
+          /p:VcpkgTriplet=x64-windows `
+          /p:AdditionalOptions="/utf-8 /source-charset:utf-8 /execution-charset:utf-8 /validate-charset" `
+          /m `
+          /verbosity:minimal
+        
+        Write-Host "构建完成"
+
+    - name: Collect artifacts
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Path "artifacts" -Force
+        
+        $dllPath = "x64\${{ env.BUILD_CONFIGURATION }}\InfiniteGUI-DLL.dll"
+        if (Test-Path $dllPath) {
+          Copy-Item -Path $dllPath -Destination "artifacts/InfiniteGUI-DLL.dll"
+          Write-Host "已复制DLL"
+        } else {
+          $dllFiles = Get-ChildItem -Recurse -Filter "InfiniteGUI-DLL.dll" -ErrorAction SilentlyContinue
+          if ($dllFiles.Count -gt 0) {
+            Copy-Item -Path $dllFiles[0].FullName -Destination "artifacts/InfiniteGUI-DLL.dll"
+          }
+        }
+        
+        $glewDllPath = "${{ env.VCPKG_DIR }}\installed\x64-windows\bin\glew32.dll"
+        if (Test-Path $glewDllPath) {
+          Copy-Item -Path $glewDllPath -Destination "artifacts/glew32.dll"
+          Write-Host "已复制GLEW DLL"
+        }
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: InfiniteGUI-DLL
+        path: artifacts/*
